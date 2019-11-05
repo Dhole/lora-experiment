@@ -19,18 +19,24 @@ use ssd1306;
 
 use embedded_graphics::fonts::Font6x8;
 use embedded_graphics::prelude::*;
+use embedded_graphics::Drawing;
 use embedded_hal::digital::v2::OutputPin;
 use ssd1306::{interface::I2cInterface, prelude::*};
 use stm32f1xx_hal::{
     self,
     device::I2C1,
-    gpio::{gpiob::PB8, gpiob::PB9, gpioc::PC13},
-    gpio::{Alternate, OpenDrain, Output, PushPull, State},
+    gpio::{
+        gpioa::{PA10, PA9},
+        gpiob::{PB8, PB9},
+        gpioc::PC13,
+    },
+    gpio::{Alternate, Floating, Input, OpenDrain, Output, PushPull, State},
     i2c::{BlockingI2c, DutyCycle, Mode},
     // pac,
     prelude::*,
+    serial::{self, Config, Rx, Serial, Tx},
     stm32,
-    timer::{CountDownTimer, Event, Timer},
+    timer::{self, CountDownTimer, Timer},
 };
 
 use stm32f1xx_hal::time::Hertz;
@@ -43,8 +49,10 @@ type OledDisplay = ssd1306::mode::graphics::GraphicsMode<
     I2cInterface<BlockingI2c<I2C1, (PB8<Alternate<OpenDrain>>, PB9<Alternate<OpenDrain>>)>>,
 >;
 
+type SerialPCTx = Tx<stm32f1::stm32f103::USART1>;
+type SerialPCRx = Rx<stm32f1::stm32f103::USART1>;
 const SYSCLK: Hertz = Hertz(72_000_000);
-const REFRESH_FREQ: Hertz = Hertz(30);
+const REFRESH_FREQ: Hertz = Hertz(8);
 
 #[app(device = stm32, monotonic = rtfm::cyccnt::CYCCNT)]
 const APP: () = {
@@ -52,8 +60,11 @@ const APP: () = {
         led: PC13<Output<PushPull>>,
         timer_handler: CountDownTimer<stm32::TIM1>,
         display: OledDisplay,
+        tx_pc: SerialPCTx,
+        rx_pc: SerialPCRx,
+        rx_pc_str: ArrayString<[u8; 32]>,
         #[init(0)]
-        idle_cnt: u32,
+        idle_dur: u32,
         #[init(false)]
         led_state: bool,
     }
@@ -83,8 +94,9 @@ const APP: () = {
         assert!(clocks.usbclk_valid());
 
         // Acquire the GPIOC peripheral
-        let mut gpioc = dp.GPIOC.split(&mut rcc.apb2);
+        let mut gpioa = dp.GPIOA.split(&mut rcc.apb2);
         let mut gpiob = dp.GPIOB.split(&mut rcc.apb2);
+        let mut gpioc = dp.GPIOC.split(&mut rcc.apb2);
 
         // Configure gpio C pin 13 as a push-pull output. The `crh` register is passed to the
         // function in order to configure the port. For pins 0-7, crl should be passed instead
@@ -115,60 +127,93 @@ const APP: () = {
         display.init().unwrap();
         display.flush().unwrap();
 
+        // USART1
+        let tx_pc = gpioa.pa9.into_alternate_push_pull(&mut gpioa.crh);
+        let rx_pc = gpioa.pa10;
+        let mut serial_pc = Serial::usart1(
+            dp.USART1,
+            (tx_pc, rx_pc),
+            &mut afio.mapr,
+            Config::default().baudrate(9600.bps()),
+            clocks,
+            &mut rcc.apb2,
+        );
+        let (mut tx_pc, mut rx_pc) = serial_pc.split();
+        rx_pc.listen();
+
         // Configure the syst timer to trigger an update every second and enables interrupt
-        let mut timer = Timer::tim1(dp.TIM1, &clocks, &mut rcc.apb2).start_count_down(REFRESH_FREQ);
-        timer.listen(Event::Update);
+        let mut timer_handler =
+            Timer::tim1(dp.TIM1, &clocks, &mut rcc.apb2).start_count_down(REFRESH_FREQ);
+        timer_handler.listen(timer::Event::Update);
 
         // rtfm::pend(stm32::Interrupt::TIM1_UP);
 
         // Init the static resources to use them later through RTFM
         init::LateResources {
-            led: led,
-            timer_handler: timer,
-            display: display,
+            led,
+            timer_handler,
+            display,
+            tx_pc,
+            rx_pc,
+            rx_pc_str: ArrayString::<[u8; 32]>::new(),
         }
     }
 
-    #[idle(resources = [idle_cnt])]
+    #[idle(resources = [idle_dur])]
     fn idle(mut cx: idle::Context) -> ! {
+        let mut resumed = Instant::now();
         loop {
-            cx.resources.idle_cnt.lock(|idle_cnt| {
-                *idle_cnt = *idle_cnt + 1;
+            cx.resources.idle_dur.lock(|idle_dur| {
+                if *idle_dur == 0 {
+                    resumed = Instant::now();
+                }
+                *idle_dur = (Instant::now() - resumed).as_cycles();
             });
         }
     }
 
-    #[task(binds = TIM1_UP, resources = [display, timer_handler, idle_cnt], priority = 1)]
-    fn tim1_up(cx: tim1_up::Context) {
+    #[task(binds = TIM1_UP, resources = [display, timer_handler, idle_dur, rx_pc_str], priority = 1)]
+    fn tim1_up(mut cx: tim1_up::Context) {
         // Depending on the application, you could want to delegate some of the work done here to
         // the idle task if you want to minimize the latency of interrupts with same priority (if
         // you have any). That could be done with some kind of machine state, etc.
 
         // Count used to change the timer update frequency
         static mut count: u8 = 0;
-        static mut started: bool = false;
-        static mut max_idle: f32 = 1.0;
+        static mut idle: f32 = 0.0;
 
-        let mut buf = ArrayString::<[u8; 32]>::new();
-        let load = 1.0 - (*cx.resources.idle_cnt as f32 / *max_idle);
-        write!(&mut buf, "{:.3}% {}", load, count).unwrap();
+        *idle = *idle * 0.8
+            + 0.2 * (*cx.resources.idle_dur as f32 / (SYSCLK.0 / REFRESH_FREQ.0) as f32);
+        *cx.resources.idle_dur = 0;
+
+        let mut line1 = ArrayString::<[u8; 32]>::new();
+        write!(&mut line1, "{:.3}% {}", 1.0 - *idle, count).unwrap();
+        let mut line2 = ArrayString::<[u8; 32]>::new();
+        cx.resources.rx_pc_str.lock(|rx_pc_str| {
+            write!(&mut line2, "{}", rx_pc_str).unwrap();
+        });
         cx.resources.display.clear();
         cx.resources.display.draw(
-            Font6x8::render_str(&buf)
-                .with_stroke(Some(1u8.into()))
-                .into_iter(),
+            Font6x8::render_str(&line1).into_iter().chain(
+                Font6x8::render_str(&line2)
+                    .translate(Point::new(0, 16))
+                    .into_iter(),
+            ),
         );
         cx.resources.display.flush().unwrap();
-
-        if !*started {
-            *max_idle = *cx.resources.idle_cnt as f32;
-            *started = true;
-        }
-        *cx.resources.idle_cnt = 0;
 
         *count += 1;
         // Clears the update flag
         cx.resources.timer_handler.clear_update_interrupt_flag();
+    }
+
+    #[task(binds = USART1, resources = [rx_pc, rx_pc_str], priority = 2)]
+    fn usart0_rx(cx: usart0_rx::Context) {
+        let b = cx.resources.rx_pc.read().unwrap();
+        if cx.resources.rx_pc_str.len() == 32 {
+            cx.resources.rx_pc_str.clear();
+        }
+        cx.resources.rx_pc_str.push(char::from(b));
     }
 
     // extern "C" {
