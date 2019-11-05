@@ -13,6 +13,7 @@ use panic_halt as _;
 
 // use cortex_m::asm::wfi;
 use rtfm::app;
+use rtfm::cyccnt::{Duration, Instant};
 
 use ssd1306;
 
@@ -35,6 +36,7 @@ use stm32f1xx_hal::{
 use stm32f1xx_hal::time::Hertz;
 
 use arrayvec::ArrayString;
+use core::convert::TryInto;
 use core::fmt::Write;
 
 type OledDisplay = ssd1306::mode::graphics::GraphicsMode<
@@ -42,19 +44,25 @@ type OledDisplay = ssd1306::mode::graphics::GraphicsMode<
 >;
 
 const SYSCLK: Hertz = Hertz(72_000_000);
+const REFRESH_FREQ: Hertz = Hertz(30);
 
-#[app(device = stm32)]
+#[app(device = stm32, monotonic = rtfm::cyccnt::CYCCNT)]
 const APP: () = {
     struct Resources {
         led: PC13<Output<PushPull>>,
         timer_handler: CountDownTimer<stm32::TIM1>,
         display: OledDisplay,
+        #[init(0)]
+        idle_cnt: u32,
         #[init(false)]
         led_state: bool,
     }
 
     #[init]
-    fn init(_: init::Context) -> init::LateResources {
+    fn init(mut cx: init::Context) -> init::LateResources {
+        // Initialize (enable) the monotonic timer (CYCCNT)
+        cx.core.DCB.enable_trace();
+        cx.core.DWT.enable_cycle_counter();
         let dp = stm32::Peripherals::take().unwrap();
         // let p = &mut c.core; //cortex_m::peripheral::Peripherals::take().unwrap();
         //                      // Take ownership over the raw flash and rcc devices and convert them into the corresponding
@@ -108,7 +116,7 @@ const APP: () = {
         display.flush().unwrap();
 
         // Configure the syst timer to trigger an update every second and enables interrupt
-        let mut timer = Timer::tim1(dp.TIM1, &clocks, &mut rcc.apb2).start_count_down(1.hz());
+        let mut timer = Timer::tim1(dp.TIM1, &clocks, &mut rcc.apb2).start_count_down(REFRESH_FREQ);
         timer.listen(Event::Update);
 
         // rtfm::pend(stm32::Interrupt::TIM1_UP);
@@ -121,50 +129,44 @@ const APP: () = {
         }
     }
 
-    #[idle(resources = [display])]
-    fn idle(cx: idle::Context) -> ! {
-        static mut i: u32 = 0;
-        let mut buf: ArrayString<[u8; 16]> = ArrayString::<[u8; 16]>::new();
+    #[idle(resources = [idle_cnt])]
+    fn idle(mut cx: idle::Context) -> ! {
         loop {
-            *i += 1;
-            buf.clear();
-            write!(&mut buf, "{:010}", i).unwrap();
-            cx.resources.display.draw(
-                Font6x8::render_str(&buf)
-                    .with_stroke(Some(1u8.into()))
-                    .into_iter(),
-            );
-            cx.resources.display.flush().unwrap();
+            cx.resources.idle_cnt.lock(|idle_cnt| {
+                *idle_cnt = *idle_cnt + 1;
+            });
         }
     }
 
-    #[task(binds = TIM1_UP, resources = [led, timer_handler, led_state], priority = 1)]
+    #[task(binds = TIM1_UP, resources = [display, timer_handler, idle_cnt], priority = 1)]
     fn tim1_up(cx: tim1_up::Context) {
         // Depending on the application, you could want to delegate some of the work done here to
         // the idle task if you want to minimize the latency of interrupts with same priority (if
         // you have any). That could be done with some kind of machine state, etc.
 
         // Count used to change the timer update frequency
-        static mut COUNT: u8 = 0;
+        static mut count: u8 = 0;
+        static mut started: bool = false;
+        static mut max_idle: f32 = 1.0;
 
-        if *cx.resources.led_state {
-            // Uses resourcers managed by rtfm to turn led off (on bluepill)
-            cx.resources.led.set_high().unwrap();
-            *cx.resources.led_state = false;
-        } else {
-            cx.resources.led.set_low().unwrap();
-            *cx.resources.led_state = true;
+        let mut buf = ArrayString::<[u8; 32]>::new();
+        let load = 1.0 - (*cx.resources.idle_cnt as f32 / *max_idle);
+        write!(&mut buf, "{:.3}% {}", load, count).unwrap();
+        cx.resources.display.clear();
+        cx.resources.display.draw(
+            Font6x8::render_str(&buf)
+                .with_stroke(Some(1u8.into()))
+                .into_iter(),
+        );
+        cx.resources.display.flush().unwrap();
+
+        if !*started {
+            *max_idle = *cx.resources.idle_cnt as f32;
+            *started = true;
         }
-        *COUNT += 1;
+        *cx.resources.idle_cnt = 0;
 
-        if *COUNT == 4 {
-            // Changes timer update frequency
-            cx.resources.timer_handler.start(2.hz());
-        } else if *COUNT == 12 {
-            cx.resources.timer_handler.start(1.hz());
-            *COUNT = 0;
-        }
-
+        *count += 1;
         // Clears the update flag
         cx.resources.timer_handler.clear_update_interrupt_flag();
     }
