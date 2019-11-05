@@ -22,6 +22,10 @@ panic-semihosting = ">=0.5"
 ssd1306 = "0.2.5"
 embedded-hal = ">=0.2.3"
 
+[dependencies.arrayvec]
+default-features = false
+version = "0.5.1"
+
 [dependencies.stm32f1]
 features = ["stm32f103", "rt"]
 version = "0.8.0"
