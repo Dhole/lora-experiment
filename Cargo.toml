@@ -25,7 +25,9 @@ embedded-hal = ">=0.2.3"
 
 [dependencies.arrayvec]
 default-features = false
-version = "0.5.1"
+#version = "0.5.1"
+path = "../arrayvec"
+features = ["as-slice"]
 
 [dependencies.stm32f1]
 features = ["stm32f103", "rt"]

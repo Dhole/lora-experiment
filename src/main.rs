@@ -25,6 +25,7 @@ use ssd1306::{interface::I2cInterface, prelude::*};
 use stm32f1xx_hal::{
     self,
     device::I2C1,
+    dma,
     gpio::{
         gpioa::{PA10, PA9},
         gpiob::{PB8, PB9},
@@ -34,23 +35,33 @@ use stm32f1xx_hal::{
     i2c::{BlockingI2c, DutyCycle, Mode},
     // pac,
     prelude::*,
-    serial::{self, Config, Rx, Serial, Tx},
+    serial::{self, Config, Serial},
     stm32,
     timer::{self, CountDownTimer, Timer},
 };
 
 use stm32f1xx_hal::time::Hertz;
 
-use arrayvec::ArrayString;
+use arrayvec::{ArrayString, ArrayVec};
 use core::convert::TryInto;
 use core::fmt::Write;
+use cortex_m::singleton;
+use stm32f1::stm32f103::USART1;
 
 type OledDisplay = ssd1306::mode::graphics::GraphicsMode<
     I2cInterface<BlockingI2c<I2C1, (PB8<Alternate<OpenDrain>>, PB9<Alternate<OpenDrain>>)>>,
 >;
 
-type SerialPCTx = Tx<stm32f1::stm32f103::USART1>;
-type SerialPCRx = Rx<stm32f1::stm32f103::USART1>;
+type SerialPCTx = serial::Tx<USART1>;
+type SerialPCRx = serial::Rx<USART1>;
+type SerialPCRxDma = dma::RxDma<SerialPCRx, dma::dma1::C5>;
+// type SerialPCRxDmaTransfer =
+//     dma::Transfer<dma::W, &'static mut [u8; 4], dma::RxDma<serial::Rx<USART1>, dma::dma1::C5>>;
+type SerialPCRxDmaTransfer = dma::Transfer<
+    dma::W,
+    &'static mut ArrayVec<[u8; 32]>,
+    dma::RxDma<serial::Rx<USART1>, dma::dma1::C5>,
+>;
 const SYSCLK: Hertz = Hertz(72_000_000);
 const REFRESH_FREQ: Hertz = Hertz(8);
 
@@ -61,7 +72,10 @@ const APP: () = {
         timer_handler: CountDownTimer<stm32::TIM1>,
         display: OledDisplay,
         tx_pc: SerialPCTx,
-        rx_pc: SerialPCRx,
+        rx_pc: Option<SerialPCRxDma>,
+        #[init(None)]
+        transfer: Option<SerialPCRxDmaTransfer>,
+        // rx_pc: SerialPCRx,
         rx_pc_str: ArrayString<[u8; 32]>,
         #[init(0)]
         idle_dur: u32,
@@ -127,6 +141,8 @@ const APP: () = {
         display.init().unwrap();
         display.flush().unwrap();
 
+        let channels = dp.DMA1.split(&mut rcc.ahb);
+
         // USART1
         let tx_pc = gpioa.pa9.into_alternate_push_pull(&mut gpioa.crh);
         let rx_pc = gpioa.pa10;
@@ -139,14 +155,15 @@ const APP: () = {
             &mut rcc.apb2,
         );
         let (mut tx_pc, mut rx_pc) = serial_pc.split();
-        rx_pc.listen();
+        // rx_pc.listen();
+        let mut rx_pc = rx_pc.with_dma(channels.5);
 
         // Configure the syst timer to trigger an update every second and enables interrupt
         let mut timer_handler =
             Timer::tim1(dp.TIM1, &clocks, &mut rcc.apb2).start_count_down(REFRESH_FREQ);
         timer_handler.listen(timer::Event::Update);
 
-        // rtfm::pend(stm32::Interrupt::TIM1_UP);
+        rtfm::pend(stm32::Interrupt::USART1);
 
         // Init the static resources to use them later through RTFM
         init::LateResources {
@@ -154,7 +171,7 @@ const APP: () = {
             timer_handler,
             display,
             tx_pc,
-            rx_pc,
+            rx_pc: Some(rx_pc),
             rx_pc_str: ArrayString::<[u8; 32]>::new(),
         }
     }
@@ -207,13 +224,47 @@ const APP: () = {
         cx.resources.timer_handler.clear_update_interrupt_flag();
     }
 
-    #[task(binds = USART1, resources = [rx_pc, rx_pc_str], priority = 2)]
+    #[task(binds = USART1, resources = [rx_pc, rx_pc_str, transfer], priority = 2)]
     fn usart0_rx(cx: usart0_rx::Context) {
-        let b = cx.resources.rx_pc.read().unwrap();
-        if cx.resources.rx_pc_str.len() == 32 {
-            cx.resources.rx_pc_str.clear();
+        static mut state: u8 = 0;
+        static mut rx_pc: Option<SerialPCRxDma> = None;
+        static mut transfer: Option<SerialPCRxDmaTransfer> = None;
+
+        // static mut buf: Option<[u8; 4]> = Some([0; 4]);
+        // static mut buf: [u8; 4] = [0; 4];
+        // static mut buf: &'static mut [u8; 8] = singleton!(: [u8; 8] = [0; 8]).unwrap();
+        // let mut buf = [0; 4];
+
+        match state {
+            0 => {
+                *rx_pc = Some(cx.resources.rx_pc.take().unwrap());
+                let rx_pc = rx_pc.take().unwrap();
+                // let rx_pc = cx.resources.rx_pc.take().unwrap();
+
+                // let buf = singleton!(: [u8; 4] = [0; 4]).unwrap();
+                let buf = singleton!(: ArrayVec<[u8; 32]> = ArrayVec::<[u8; 32]>::new()).unwrap();
+
+                // *transfer = Some(rx_pc.read(buf));
+                // let transfer = rx_pc.read(&mut buf);
+                // let mut buf = buf.take().unwrap();
+                *transfer = Some(rx_pc.read(buf));
+                // *cx.resources.transfer = Some(rx_pc.read(buf));
+                // let transfer = rx_pc.read(&mut buf);
+                *state = 1;
+            }
+            1 => {
+                *state = 2;
+            }
+            2 => {
+                *state = 1;
+            }
+            _ => unreachable!(),
         }
-        cx.resources.rx_pc_str.push(char::from(b));
+        // let b = cx.resources.rx_pc.read().unwrap();
+        // if cx.resources.rx_pc_str.len() == 32 {
+        //     cx.resources.rx_pc_str.clear();
+        // }
+        // cx.resources.rx_pc_str.push(char::from(b));
     }
 
     // extern "C" {
