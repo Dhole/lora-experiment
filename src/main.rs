@@ -45,6 +45,7 @@ use stm32f1xx_hal::time::Hertz;
 use arrayvec::{ArrayString, ArrayVec};
 use core::convert::TryInto;
 use core::fmt::Write;
+use core::str;
 use cortex_m::singleton;
 use stm32f1::stm32f103::USART1;
 
@@ -141,7 +142,7 @@ const APP: () = {
         display.init().unwrap();
         display.flush().unwrap();
 
-        let channels = dp.DMA1.split(&mut rcc.ahb);
+        let mut dma1_channels = dp.DMA1.split(&mut rcc.ahb);
 
         // USART1
         let tx_pc = gpioa.pa9.into_alternate_push_pull(&mut gpioa.crh);
@@ -156,14 +157,15 @@ const APP: () = {
         );
         let (mut tx_pc, mut rx_pc) = serial_pc.split();
         // rx_pc.listen();
-        let mut rx_pc = rx_pc.with_dma(channels.5);
+        dma1_channels.5.listen(dma::Event::TransferComplete);
+        let mut rx_pc = rx_pc.with_dma(dma1_channels.5);
 
         // Configure the syst timer to trigger an update every second and enables interrupt
         let mut timer_handler =
             Timer::tim1(dp.TIM1, &clocks, &mut rcc.apb2).start_count_down(REFRESH_FREQ);
         timer_handler.listen(timer::Event::Update);
 
-        rtfm::pend(stm32::Interrupt::USART1);
+        rtfm::pend(stm32::Interrupt::DMA1_CHANNEL5);
 
         // Init the static resources to use them later through RTFM
         init::LateResources {
@@ -224,8 +226,8 @@ const APP: () = {
         cx.resources.timer_handler.clear_update_interrupt_flag();
     }
 
-    #[task(binds = USART1, resources = [rx_pc, rx_pc_str, transfer], priority = 2)]
-    fn usart0_rx(cx: usart0_rx::Context) {
+    #[task(binds = DMA1_CHANNEL5, resources = [rx_pc, rx_pc_str, transfer], priority = 2)]
+    fn rx_pc_dma(cx: rx_pc_dma::Context) {
         static mut state: u8 = 0;
         static mut rx_pc: Option<SerialPCRxDma> = None;
         static mut transfer: Option<SerialPCRxDmaTransfer> = None;
@@ -247,16 +249,24 @@ const APP: () = {
                 // *transfer = Some(rx_pc.read(buf));
                 // let transfer = rx_pc.read(&mut buf);
                 // let mut buf = buf.take().unwrap();
+                unsafe {
+                    buf.set_len(4);
+                }
                 *transfer = Some(rx_pc.read(buf));
                 // *cx.resources.transfer = Some(rx_pc.read(buf));
                 // let transfer = rx_pc.read(&mut buf);
                 *state = 1;
             }
             1 => {
+                let transfer = transfer.take().unwrap();
+                let (buf, rx_pc) = transfer.wait();
+                cx.resources
+                    .rx_pc_str
+                    .push_str(str::from_utf8(&buf).unwrap());
                 *state = 2;
             }
             2 => {
-                *state = 1;
+                *state = 2;
             }
             _ => unreachable!(),
         }
