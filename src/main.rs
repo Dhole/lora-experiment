@@ -8,6 +8,11 @@
 #![no_std]
 #![no_main]
 
+#[macro_use]
+extern crate urpc;
+
+use urpc::{consts, server};
+
 // you can put a breakpoint on `rust_begin_unwind` to catch panics
 use panic_halt as _;
 
@@ -49,6 +54,8 @@ use core::str;
 use cortex_m::singleton;
 use stm32f1::stm32f103::USART1;
 
+// use crate::rpc_packet;
+
 type OledDisplay = ssd1306::mode::graphics::GraphicsMode<
     I2cInterface<BlockingI2c<I2C1, (PB8<Alternate<OpenDrain>>, PB9<Alternate<OpenDrain>>)>>,
 >;
@@ -56,6 +63,7 @@ type OledDisplay = ssd1306::mode::graphics::GraphicsMode<
 type SerialPCTx = serial::Tx<USART1>;
 type SerialPCRx = serial::Rx<USART1>;
 type SerialPCRxDma = dma::RxDma<SerialPCRx, dma::dma1::C5>;
+type SerialPCTxDma = dma::TxDma<SerialPCTx, dma::dma1::C4>;
 // type SerialPCRxDmaTransfer =
 //     dma::Transfer<dma::W, &'static mut [u8; 4], dma::RxDma<serial::Rx<USART1>, dma::dma1::C5>>;
 type SerialPCRxDmaTransfer = dma::Transfer<
@@ -66,13 +74,20 @@ type SerialPCRxDmaTransfer = dma::Transfer<
 const SYSCLK: Hertz = Hertz(72_000_000);
 const REFRESH_FREQ: Hertz = Hertz(8);
 
+server_requests! {
+    ServerRequest;
+    (0, Ping([u8; 4], [u8; 4])),
+    (1, SendBytes((), ())),
+    (2, Add((u8, u8), u8))
+}
+
 #[app(device = stm32, monotonic = rtfm::cyccnt::CYCCNT)]
 const APP: () = {
     struct Resources {
         led: PC13<Output<PushPull>>,
         timer_handler: CountDownTimer<stm32::TIM1>,
         display: OledDisplay,
-        tx_pc: SerialPCTx,
+        tx_pc: Option<SerialPCTxDma>,
         rx_pc: Option<SerialPCRxDma>,
         #[init(None)]
         transfer: Option<SerialPCRxDmaTransfer>,
@@ -159,6 +174,8 @@ const APP: () = {
         // rx_pc.listen();
         dma1_channels.5.listen(dma::Event::TransferComplete);
         let mut rx_pc = rx_pc.with_dma(dma1_channels.5);
+        dma1_channels.4.listen(dma::Event::TransferComplete);
+        let mut tx_pc = tx_pc.with_dma(dma1_channels.4);
 
         // Configure the syst timer to trigger an update every second and enables interrupt
         let mut timer_handler =
@@ -172,7 +189,7 @@ const APP: () = {
             led,
             timer_handler,
             display,
-            tx_pc,
+            tx_pc: Some(tx_pc),
             rx_pc: Some(rx_pc),
             rx_pc_str: ArrayString::<[u8; 32]>::new(),
         }
@@ -228,19 +245,20 @@ const APP: () = {
 
     #[task(binds = DMA1_CHANNEL5, resources = [rx_pc, rx_pc_str, transfer], priority = 2)]
     fn rx_pc_dma(cx: rx_pc_dma::Context) {
-        static mut state: u8 = 0;
-        static mut rx_pc: Option<SerialPCRxDma> = None;
-        static mut transfer: Option<SerialPCRxDmaTransfer> = None;
+        static mut s_init: bool = false;
+        static mut s_rx_pc: Option<SerialPCRxDma> = None;
+        static mut s_transfer: Option<SerialPCRxDmaTransfer> = None;
+        static mut s_rpc_server: Option<server::RpcServer<ServerRequest>> = None;
 
         // static mut buf: Option<[u8; 4]> = Some([0; 4]);
         // static mut buf: [u8; 4] = [0; 4];
         // static mut buf: &'static mut [u8; 8] = singleton!(: [u8; 8] = [0; 8]).unwrap();
         // let mut buf = [0; 4];
 
-        match state {
-            0 => {
-                *rx_pc = Some(cx.resources.rx_pc.take().unwrap());
-                let rx_pc = rx_pc.take().unwrap();
+        match s_init {
+            false => {
+                *s_rpc_server = Some(server::RpcServer::<ServerRequest>::new());
+                let rx_pc = cx.resources.rx_pc.take().unwrap();
                 // let rx_pc = cx.resources.rx_pc.take().unwrap();
 
                 // let buf = singleton!(: [u8; 4] = [0; 4]).unwrap();
@@ -250,25 +268,55 @@ const APP: () = {
                 // let transfer = rx_pc.read(&mut buf);
                 // let mut buf = buf.take().unwrap();
                 unsafe {
-                    buf.set_len(4);
+                    buf.set_len(consts::REQ_HEADER_LEN);
                 }
-                *transfer = Some(rx_pc.read(buf));
+                *s_transfer = Some(rx_pc.read(buf));
                 // *cx.resources.transfer = Some(rx_pc.read(buf));
                 // let transfer = rx_pc.read(&mut buf);
-                *state = 1;
+                *s_init = true;
             }
-            1 => {
-                let transfer = transfer.take().unwrap();
-                let (buf, rx_pc) = transfer.wait();
-                cx.resources
-                    .rx_pc_str
-                    .push_str(str::from_utf8(&buf).unwrap());
-                *state = 2;
+            true => {
+                let mut rpc_server = s_rpc_server.take().unwrap();
+                let transfer = s_transfer.take().unwrap();
+                let (mut buf, rx_pc) = transfer.wait();
+
+                let read_len = match rpc_server.parse(&buf) {
+                    server::ParseResult::NeedBytes(n) => n,
+                    server::ParseResult::Request(req, opt_buf) => {
+                        match req.unwrap() {
+                            ServerRequest::Ping(ping) => {
+                                let ping_body = ping.body;
+                                cx.resources.rx_pc_str.clear();
+                                write!(
+                                    cx.resources.rx_pc_str,
+                                    "PING: {}",
+                                    str::from_utf8(&ping_body).unwrap()
+                                )
+                                .unwrap();
+                                // ping.reply(ping_body, &mut write_buf).unwrap();
+                            }
+                            ServerRequest::SendBytes(send_bytes) => {
+                                // send_bytes.reply((), &mut write_buf).unwrap();
+                            }
+                            ServerRequest::Add(add) => {
+                                let (x, y) = add.body;
+                                cx.resources.rx_pc_str.clear();
+                                write!(cx.resources.rx_pc_str, "{} + {}", x, y).unwrap();
+                            }
+                        }
+                        consts::REQ_HEADER_LEN
+                    }
+                };
+                // cx.resources
+                //     .rx_pc_str
+                //     .push_str(str::from_utf8(&buf).unwrap());
+
+                unsafe {
+                    buf.set_len(read_len);
+                }
+                *s_transfer = Some(rx_pc.read(buf));
+                *s_rpc_server = Some(rpc_server);
             }
-            2 => {
-                *state = 2;
-            }
-            _ => unreachable!(),
         }
         // let b = cx.resources.rx_pc.read().unwrap();
         // if cx.resources.rx_pc_str.len() == 32 {

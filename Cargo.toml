@@ -23,6 +23,10 @@ panic-semihosting = ">=0.5"
 ssd1306 = ">=0.3.0-alpha.2"
 embedded-hal = ">=0.2.3"
 
+[dependencies.urpc]
+path = "../urpc"
+default-features = false
+
 [dependencies.arrayvec]
 default-features = false
 #version = "0.5.1"
