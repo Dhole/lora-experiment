@@ -90,7 +90,7 @@ const APP: () = {
         tx_pc: Option<SerialPCTxDma>,
         rx_pc: Option<SerialPCRxDma>,
         #[init(None)]
-        transfer: Option<SerialPCRxDmaTransfer>,
+        rx_pc_transfer: Option<SerialPCRxDmaTransfer>,
         // rx_pc: SerialPCRx,
         rx_pc_str: ArrayString<[u8; 32]>,
         #[init(0)]
@@ -174,7 +174,7 @@ const APP: () = {
         // rx_pc.listen();
         dma1_channels.5.listen(dma::Event::TransferComplete);
         let mut rx_pc = rx_pc.with_dma(dma1_channels.5);
-        dma1_channels.4.listen(dma::Event::TransferComplete);
+        // dma1_channels.4.listen(dma::Event::TransferComplete);
         let mut tx_pc = tx_pc.with_dma(dma1_channels.4);
 
         // Configure the syst timer to trigger an update every second and enables interrupt
@@ -243,86 +243,89 @@ const APP: () = {
         cx.resources.timer_handler.clear_update_interrupt_flag();
     }
 
-    #[task(binds = DMA1_CHANNEL5, resources = [rx_pc, rx_pc_str, transfer], priority = 2)]
+    // #[task(binds = DMA1_CHANNEL4, priority = 3)]
+    // fn tx_pc_dma(cx: tx_pc_dma::Context) {}
+
+    #[task(binds = DMA1_CHANNEL5, resources = [rx_pc, rx_pc_str, rx_pc_transfer, tx_pc], priority = 2)]
     fn rx_pc_dma(cx: rx_pc_dma::Context) {
         static mut s_init: bool = false;
         static mut s_rx_pc: Option<SerialPCRxDma> = None;
-        static mut s_transfer: Option<SerialPCRxDmaTransfer> = None;
+        static mut s_rx_pc_transfer: Option<SerialPCRxDmaTransfer> = None;
         static mut s_rpc_server: Option<server::RpcServer<ServerRequest>> = None;
+        static mut s_tx_buf: Option<&'static mut ArrayVec<[u8; 32]>> = None;
 
-        // static mut buf: Option<[u8; 4]> = Some([0; 4]);
-        // static mut buf: [u8; 4] = [0; 4];
-        // static mut buf: &'static mut [u8; 8] = singleton!(: [u8; 8] = [0; 8]).unwrap();
-        // let mut buf = [0; 4];
+        if !*s_init {
+            *s_rpc_server = Some(server::RpcServer::<ServerRequest>::new());
+            let rx_pc = cx.resources.rx_pc.take().unwrap();
 
-        match s_init {
-            false => {
-                *s_rpc_server = Some(server::RpcServer::<ServerRequest>::new());
-                let rx_pc = cx.resources.rx_pc.take().unwrap();
-                // let rx_pc = cx.resources.rx_pc.take().unwrap();
+            let rx_buf = singleton!(: ArrayVec<[u8; 32]> = ArrayVec::<[u8; 32]>::new()).unwrap();
+            *s_tx_buf =
+                Some(singleton!(: ArrayVec<[u8; 32]> = ArrayVec::<[u8; 32]>::new()).unwrap());
 
-                // let buf = singleton!(: [u8; 4] = [0; 4]).unwrap();
-                let buf = singleton!(: ArrayVec<[u8; 32]> = ArrayVec::<[u8; 32]>::new()).unwrap();
-
-                // *transfer = Some(rx_pc.read(buf));
-                // let transfer = rx_pc.read(&mut buf);
-                // let mut buf = buf.take().unwrap();
-                unsafe {
-                    buf.set_len(consts::REQ_HEADER_LEN);
-                }
-                *s_transfer = Some(rx_pc.read(buf));
-                // *cx.resources.transfer = Some(rx_pc.read(buf));
-                // let transfer = rx_pc.read(&mut buf);
-                *s_init = true;
+            unsafe {
+                rx_buf.set_len(consts::REQ_HEADER_LEN);
             }
-            true => {
-                let mut rpc_server = s_rpc_server.take().unwrap();
-                let transfer = s_transfer.take().unwrap();
-                let (mut buf, rx_pc) = transfer.wait();
+            *s_rx_pc_transfer = Some(rx_pc.read(rx_buf));
+            *s_init = true;
+            return;
+        }
 
-                let read_len = match rpc_server.parse(&buf) {
-                    server::ParseResult::NeedBytes(n) => n,
-                    server::ParseResult::Request(req, opt_buf) => {
-                        match req.unwrap() {
-                            ServerRequest::Ping(ping) => {
-                                let ping_body = ping.body;
-                                cx.resources.rx_pc_str.clear();
-                                write!(
-                                    cx.resources.rx_pc_str,
-                                    "PING: {}",
-                                    str::from_utf8(&ping_body).unwrap()
-                                )
-                                .unwrap();
-                                // ping.reply(ping_body, &mut write_buf).unwrap();
-                            }
-                            ServerRequest::SendBytes(send_bytes) => {
-                                // send_bytes.reply((), &mut write_buf).unwrap();
-                            }
-                            ServerRequest::Add(add) => {
-                                let (x, y) = add.body;
-                                cx.resources.rx_pc_str.clear();
-                                write!(cx.resources.rx_pc_str, "{} + {}", x, y).unwrap();
-                            }
-                        }
-                        consts::REQ_HEADER_LEN
+        let mut rpc_server = s_rpc_server.take().unwrap();
+        let rx_pc_transfer = s_rx_pc_transfer.take().unwrap();
+        let (mut rx_buf, rx_pc) = rx_pc_transfer.wait();
+
+        let read_len = match rpc_server.parse(&rx_buf) {
+            server::ParseResult::NeedBytes(n) => n,
+            server::ParseResult::Request(req, opt_buf) => {
+                let mut tx_buf = s_tx_buf.take().unwrap();
+                unsafe {
+                    tx_buf.set_len(32);
+                }
+                let write_len = match req.unwrap() {
+                    ServerRequest::Ping(ping) => {
+                        let ping_body = ping.body;
+                        cx.resources.rx_pc_str.clear();
+                        write!(
+                            cx.resources.rx_pc_str,
+                            "PING: {}",
+                            str::from_utf8(&ping_body).unwrap()
+                        )
+                        .unwrap();
+                        ping.reply(ping_body, &mut tx_buf).unwrap()
+                    }
+                    ServerRequest::SendBytes(send_bytes) => {
+                        // send_bytes.reply((), &mut write_buf).unwrap();
+                        0
+                    }
+                    ServerRequest::Add(add) => {
+                        let (x, y) = add.body;
+                        cx.resources.rx_pc_str.clear();
+                        write!(cx.resources.rx_pc_str, "{} + {}", x, y).unwrap();
+                        add.reply(x + y, &mut tx_buf).unwrap()
                     }
                 };
-                // cx.resources
-                //     .rx_pc_str
-                //     .push_str(str::from_utf8(&buf).unwrap());
-
                 unsafe {
-                    buf.set_len(read_len);
+                    tx_buf.set_len(write_len);
                 }
-                *s_transfer = Some(rx_pc.read(buf));
-                *s_rpc_server = Some(rpc_server);
+                let mut tx_buf = if write_len != 0 {
+                    let tx_pc = cx.resources.tx_pc.take().unwrap();
+                    let tx_pc_transfer = tx_pc.write(tx_buf);
+                    let (mut tx_buf, tx_pc) = tx_pc_transfer.wait();
+                    *cx.resources.tx_pc = Some(tx_pc);
+                    tx_buf
+                } else {
+                    tx_buf
+                };
+                *s_tx_buf = Some(tx_buf);
+                consts::REQ_HEADER_LEN
             }
+        };
+
+        unsafe {
+            rx_buf.set_len(read_len);
         }
-        // let b = cx.resources.rx_pc.read().unwrap();
-        // if cx.resources.rx_pc_str.len() == 32 {
-        //     cx.resources.rx_pc_str.clear();
-        // }
-        // cx.resources.rx_pc_str.push(char::from(b));
+        *s_rx_pc_transfer = Some(rx_pc.read(rx_buf));
+        *s_rpc_server = Some(rpc_server);
     }
 
     // extern "C" {
