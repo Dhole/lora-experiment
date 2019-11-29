@@ -9,12 +9,14 @@ else
     EXAMPLE=true
 fi
 
-if [ $EXAMPLE = true ]; then
+if [ $EXAMPLE = "true" ]; then
     cargo build --example ${NAME} --release
     arm-none-eabi-objcopy -O binary target/thumbv7m-none-eabi/release/examples/${NAME} ${NAME}.bin
 else
-    cargo build --release
-    arm-none-eabi-objcopy -O binary target/thumbv7m-none-eabi/release/${NAME} ${NAME}.bin
+    # cargo build --release
+    # arm-none-eabi-objcopy -O binary target/thumbv7m-none-eabi/release/${NAME} ${NAME}.bin
+    cargo build
+    arm-none-eabi-objcopy -O binary target/thumbv7m-none-eabi/debug/${NAME} ${NAME}.bin
 fi
 
 # stlink version

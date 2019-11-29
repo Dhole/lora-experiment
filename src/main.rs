@@ -11,10 +11,19 @@
 #[macro_use]
 extern crate urpc;
 
+// extern crate cortex_m_semihosting;
+// extern crate panic_semihosting;
+
+use cortex_m::asm;
+// use cortex_m_rt::{entry, exception};
+use panic_semihosting as _;
+
+// use cortex_m_semihosting::hprintln;
+
 use urpc::{consts, server};
 
 // you can put a breakpoint on `rust_begin_unwind` to catch panics
-use panic_halt as _;
+// use panic_halt as _;
 
 // use cortex_m::asm::wfi;
 use rtfm::app;
@@ -51,7 +60,7 @@ use arrayvec::{ArrayString, ArrayVec};
 use core::convert::TryInto;
 use core::fmt::Write;
 use core::str;
-use cortex_m::singleton;
+use cortex_m::{peripheral::DWT, singleton};
 use stm32f1::stm32f103::USART1;
 
 // use crate::rpc_packet;
@@ -184,6 +193,7 @@ const APP: () = {
 
         rtfm::pend(stm32::Interrupt::DMA1_CHANNEL5);
 
+        // hprintln!("+ Init");
         // Init the static resources to use them later through RTFM
         init::LateResources {
             led,
@@ -197,27 +207,26 @@ const APP: () = {
 
     #[idle(resources = [idle_dur])]
     fn idle(mut cx: idle::Context) -> ! {
-        let mut resumed = Instant::now();
+        let mut resumed = DWT::get_cycle_count();
         loop {
             cx.resources.idle_dur.lock(|idle_dur| {
                 if *idle_dur == 0 {
-                    resumed = Instant::now();
+                    resumed = DWT::get_cycle_count();
                 }
-                *idle_dur = (Instant::now() - resumed).as_cycles();
+                *idle_dur = {
+                    let (idle_dur, _) = DWT::get_cycle_count().overflowing_sub(resumed);
+                    idle_dur
+                };
             });
         }
     }
 
     #[task(binds = TIM1_UP, resources = [display, timer_handler, idle_dur, rx_pc_str], priority = 1)]
     fn tim1_up(mut cx: tim1_up::Context) {
-        // Depending on the application, you could want to delegate some of the work done here to
-        // the idle task if you want to minimize the latency of interrupts with same priority (if
-        // you have any). That could be done with some kind of machine state, etc.
-
-        // Count used to change the timer update frequency
         static mut count: u8 = 0;
         static mut idle: f32 = 0.0;
 
+        // hprintln!("a0");
         *idle = *idle * 0.8
             + 0.2 * (*cx.resources.idle_dur as f32 / (SYSCLK.0 / REFRESH_FREQ.0) as f32);
         *cx.resources.idle_dur = 0;
@@ -236,11 +245,20 @@ const APP: () = {
                     .into_iter(),
             ),
         );
-        cx.resources.display.flush().unwrap();
+        match cx.resources.display.flush() {
+            Ok(()) => {}
+            Err(e) => {
+                // hprintln!("{:?}", e);
+            }
+        }
 
-        *count += 1;
+        *count = {
+            let (n, _) = count.overflowing_add(1);
+            n
+        };
         // Clears the update flag
         cx.resources.timer_handler.clear_update_interrupt_flag();
+        // hprintln!("a1");
     }
 
     // #[task(binds = DMA1_CHANNEL4, priority = 3)]
@@ -254,6 +272,7 @@ const APP: () = {
         static mut s_rpc_server: Option<server::RpcServer<ServerRequest>> = None;
         static mut s_tx_buf: Option<&'static mut ArrayVec<[u8; 32]>> = None;
 
+        // hprintln!("b0");
         if !*s_init {
             *s_rpc_server = Some(server::RpcServer::<ServerRequest>::new());
             let rx_pc = cx.resources.rx_pc.take().unwrap();
@@ -326,9 +345,20 @@ const APP: () = {
         }
         *s_rx_pc_transfer = Some(rx_pc.read(rx_buf));
         *s_rpc_server = Some(rpc_server);
+        // hprintln!("b1");
     }
 
     // extern "C" {
     //     fn EXTI0();
     // }
 };
+
+// #[exception]
+// fn HardFault(ef: &cortex_m_rt::ExceptionFrame) -> ! {
+//     // prints the exception frame using semihosting
+//     let _ = hprintln!("{:#?}", ef);
+//     asm::bkpt();
+//     loop {
+//         asm::bkpt();
+//     }
+// }
