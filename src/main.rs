@@ -83,6 +83,9 @@ type SerialPCRxDmaTransfer = dma::Transfer<
 const SYSCLK: Hertz = Hertz(72_000_000);
 const REFRESH_FREQ: Hertz = Hertz(8);
 
+const RX_PC_BUF_LEN: usize = 32;
+const TX_PC_BUF_LEN: usize = 32;
+
 server_requests! {
     ServerRequest;
     (0, Ping([u8; 4], [u8; 4])),
@@ -272,20 +275,30 @@ const APP: () = {
         static mut s_rpc_server: Option<server::RpcServer<ServerRequest>> = None;
         static mut s_tx_buf: Option<&'static mut ArrayVec<[u8; 32]>> = None;
 
+        static mut s_dbg: u8 = 0;
+
         // hprintln!("b0");
         if !*s_init {
-            *s_rpc_server = Some(server::RpcServer::<ServerRequest>::new());
+            *s_rpc_server = Some(server::RpcServer::<ServerRequest>::new(
+                RX_PC_BUF_LEN as u16,
+            ));
             let rx_pc = cx.resources.rx_pc.take().unwrap();
 
-            let rx_buf = singleton!(: ArrayVec<[u8; 32]> = ArrayVec::<[u8; 32]>::new()).unwrap();
-            *s_tx_buf =
-                Some(singleton!(: ArrayVec<[u8; 32]> = ArrayVec::<[u8; 32]>::new()).unwrap());
+            let rx_buf = singleton!(: ArrayVec<[u8; RX_PC_BUF_LEN]> =
+                ArrayVec::<[u8; RX_PC_BUF_LEN]>::new())
+            .unwrap();
+            *s_tx_buf = Some(
+                singleton!(: ArrayVec<[u8; TX_PC_BUF_LEN]> =
+                        ArrayVec::<[u8; TX_PC_BUF_LEN]>::new())
+                .unwrap(),
+            );
 
             unsafe {
                 rx_buf.set_len(consts::REQ_HEADER_LEN);
             }
             *s_rx_pc_transfer = Some(rx_pc.read(rx_buf));
             *s_init = true;
+            // hprintln!("rx_pc_dma init").unwrap();
             return;
         }
 
@@ -293,7 +306,16 @@ const APP: () = {
         let rx_pc_transfer = s_rx_pc_transfer.take().unwrap();
         let (mut rx_buf, rx_pc) = rx_pc_transfer.wait();
 
-        let read_len = match rpc_server.parse(&rx_buf) {
+        // DEBUG
+        let parse_res = match rpc_server.parse(&rx_buf) {
+            Ok(r) => r,
+            Err(e) => {
+                cx.resources.rx_pc_str.clear();
+                write!(cx.resources.rx_pc_str, "XXX").unwrap();
+                return;
+            }
+        };
+        let read_len = match parse_res {
             server::ParseResult::NeedBytes(n) => n,
             server::ParseResult::Request(req, opt_buf) => {
                 let mut tx_buf = s_tx_buf.take().unwrap();
@@ -313,8 +335,14 @@ const APP: () = {
                         ping.reply(ping_body, &mut tx_buf).unwrap()
                     }
                     ServerRequest::SendBytes(send_bytes) => {
-                        // send_bytes.reply((), &mut write_buf).unwrap();
-                        0
+                        cx.resources.rx_pc_str.clear();
+                        write!(
+                            cx.resources.rx_pc_str,
+                            "BYTES: {}",
+                            str::from_utf8(&opt_buf.unwrap()).unwrap()
+                        )
+                        .unwrap();
+                        send_bytes.reply((), &mut tx_buf).unwrap()
                     }
                     ServerRequest::Add(add) => {
                         let (x, y) = add.body;
