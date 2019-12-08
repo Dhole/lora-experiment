@@ -14,6 +14,8 @@ extern crate urpc;
 // extern crate cortex_m_semihosting;
 // extern crate panic_semihosting;
 
+mod e32_lora;
+
 use cortex_m::asm;
 // use cortex_m_rt::{entry, exception};
 use panic_semihosting as _;
