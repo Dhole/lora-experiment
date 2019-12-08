@@ -1,14 +1,14 @@
 use core::convert;
 
 #[derive(Clone, Copy)]
-enum UartMode {
+pub enum UartMode {
     Parity8N1 = 0b00,
     Parity8O1 = 0b01,
     Parity8E1 = 0b10,
 }
 
 #[derive(Clone, Copy)]
-enum UartRate {
+pub enum UartRate {
     Bps1200 = 0b000,
     Bps2400 = 0b001,
     Bps4800 = 0b010,
@@ -20,7 +20,7 @@ enum UartRate {
 }
 
 #[derive(Clone, Copy)]
-enum AirRate {
+pub enum AirRate {
     Bps300 = 0b000,
     Bps1200 = 0b001,
     Bps2400 = 0b010,
@@ -30,7 +30,7 @@ enum AirRate {
 }
 
 #[derive(Clone, Copy)]
-enum Channel {
+pub enum Channel {
     Mhz410 = 0b00000,
     Mhz411 = 0b00001,
     Mhz412 = 0b00010,
@@ -66,19 +66,19 @@ enum Channel {
 }
 
 #[derive(Clone, Copy)]
-enum TransMode {
+pub enum TransMode {
     Transparent = 0b0,
     Fixed = 0b1,
 }
 
 #[derive(Clone, Copy)]
-enum IoMode {
+pub enum IoMode {
     PushPull = 0b0,
     OpenCollector = 0b1,
 }
 
 #[derive(Clone, Copy)]
-enum WakeUpTime {
+pub enum WakeUpTime {
     Ms250,
     Ms500,
     Ms750,
@@ -90,20 +90,20 @@ enum WakeUpTime {
 }
 
 #[derive(Clone, Copy)]
-enum Fec {
+pub enum Fec {
     Off = 0b0,
     On = 0b1,
 }
 
 #[derive(Clone, Copy)]
-enum TxPower {
+pub enum TxPower {
     P0,
     P1,
     P2,
     P3,
 }
 
-enum TxPower100 {
+pub enum TxPower100 {
     Dbm20,
     Dbm17,
     Dbm14,
@@ -121,7 +121,7 @@ impl convert::From<TxPower100> for TxPower {
     }
 }
 
-enum TxPower500 {
+pub enum TxPower500 {
     Dbm27,
     Dbm24,
     Dbm21,
@@ -139,7 +139,7 @@ impl convert::From<TxPower500> for TxPower {
     }
 }
 
-enum TxPower1W {
+pub enum TxPower1W {
     Dbm30,
     Dbm27,
     Dbm24,
@@ -157,7 +157,7 @@ impl convert::From<TxPower1W> for TxPower {
     }
 }
 
-struct Config {
+pub struct Config {
     addr: u16,
     uart_mode: UartMode,
     uart_rate: UartRate,
@@ -194,5 +194,125 @@ impl Config {
         params[5] |= (self.fec as u8) << 2;
         params[5] |= self.tx_power as u8;
         params
+    }
+}
+
+use embedded_hal::digital::v2::{InputPin, OutputPin};
+use stm32f1xx_hal::serial::Serial;
+
+pub enum Error<MODEPIN, AUXPIN>
+where
+    MODEPIN: OutputPin,
+    AUXPIN: InputPin,
+{
+    OutputPin(MODEPIN::Error),
+    InputPin(AUXPIN::Error),
+}
+
+// trait ErrorTrait<T> {}
+// impl<T: OutputPin> ErrorTrait<T> for T::Error {}
+// // impl<MODEPIN: OutputPin> ErrorTrait<MODEPIN> for MODEPIN::Error {}
+//
+// impl<MODEPIN, AUXPIN, ERROR> convert::From<ERROR> for Error<MODEPIN, AUXPIN>
+// where
+//     MODEPIN: OutputPin<Error = ERROR>,
+//     AUXPIN: InputPin,
+//     ERROR: ErrorTrait<MODEPIN>,
+// {
+//     fn from(error: ERROR) -> Self {
+//         Self::OutputPin(error)
+//     }
+// }
+
+// impl<MODEPIN: OutputPin, AUXPIN> convert::From<MODEPIN::Error> for Error<MODEPIN, AUXPIN> {
+//     // impl<MODEPIN: OutputPin, AUXPIN> convert::From<Error<MODEPIN, AUXPIN>> for Error<MODEPIN, AUXPIN> {
+//     fn from(error: MODEPIN::Error) -> Self {
+//         Self::OutputPin(error)
+//     }
+// }
+
+struct ModePins<MODEPIN>
+where
+    MODEPIN: OutputPin,
+{
+    m0: MODEPIN,
+    m1: MODEPIN,
+}
+
+enum Mode {
+    Normal = 0b00,
+    WakeUp = 0b01,
+    PowerSaving = 0b10,
+    Sleep = 0b11,
+}
+
+impl<MODEPIN> ModePins<MODEPIN>
+where
+    MODEPIN: OutputPin,
+{
+    fn set(&mut self, mode: Mode) -> Result<(), MODEPIN::Error> {
+        let (m0_high, m1_high) = match mode {
+            Mode::Normal => (false, false),
+            Mode::WakeUp => (false, false),
+            Mode::PowerSaving => (false, false),
+            Mode::Sleep => (false, false),
+        };
+        if m0_high {
+            self.m0.set_high()?;
+        } else {
+            self.m0.set_low()?;
+        }
+        if m1_high {
+            self.m1.set_high()?;
+        } else {
+            self.m1.set_low()?;
+        }
+        Ok(())
+    }
+}
+
+struct LoRa<USART, SERIALPINS, MODEPIN, AUXPIN>
+where
+    MODEPIN: OutputPin,
+    AUXPIN: InputPin,
+{
+    cfg: Config,
+    serial: Serial<USART, SERIALPINS>,
+    mode_pins: ModePins<MODEPIN>,
+    aux: AUXPIN,
+}
+
+impl<USART, SERIALPINS, MODEPIN, AUXPIN> LoRa<USART, SERIALPINS, MODEPIN, AUXPIN>
+where
+    MODEPIN: OutputPin,
+    AUXPIN: InputPin,
+{
+    pub fn new(
+        mode_pins: ModePins<MODEPIN>,
+        aux: AUXPIN,
+        serial: Serial<USART, SERIALPINS>,
+        cfg: Config,
+    ) -> Self {
+        Self {
+            cfg,
+            serial,
+            mode_pins,
+            aux,
+        }
+    }
+
+    pub fn ready(&self) -> Result<(), AUXPIN::Error> {
+        while self.aux.is_low()? {}
+        Ok(())
+    }
+
+    pub fn set_cfg(&mut self, cfg: Config) -> Result<(), Error<MODEPIN, AUXPIN>> {
+        self.cfg = cfg;
+        self.mode_pins
+            .set(Mode::Sleep)
+            .map_err(|e| Error::OutputPin(e))?;
+        self.ready().map_err(|e| Error::InputPin(e))?;
+        // self.serial.
+        Ok(())
     }
 }
