@@ -250,7 +250,7 @@ impl<MODEPIN> ModePins<MODEPIN>
 where
     MODEPIN: OutputPin,
 {
-    fn set(&mut self, mode: Mode) -> Result<(), MODEPIN::Error> {
+    fn _set(&mut self, mode: Mode) -> Result<(), MODEPIN::Error> {
         let (m0_high, m1_high) = match mode {
             Mode::Normal => (false, false),
             Mode::WakeUp => (false, false),
@@ -267,6 +267,10 @@ where
         } else {
             self.m1.set_low()?;
         }
+        Ok(())
+    }
+    fn set<AUXPIN: InputPin>(&mut self, mode: Mode) -> Result<(), Error<MODEPIN, AUXPIN>> {
+        self._set(mode).map_err(|e| Error::OutputPin(e))?;
         Ok(())
     }
 }
@@ -301,17 +305,15 @@ where
         }
     }
 
-    pub fn ready(&self) -> Result<(), AUXPIN::Error> {
-        while self.aux.is_low()? {}
+    pub fn ready(&self) -> Result<(), Error<MODEPIN, AUXPIN>> {
+        while self.aux.is_low().map_err(|e| Error::InputPin(e))? {}
         Ok(())
     }
 
     pub fn set_cfg(&mut self, cfg: Config) -> Result<(), Error<MODEPIN, AUXPIN>> {
         self.cfg = cfg;
-        self.mode_pins
-            .set(Mode::Sleep)
-            .map_err(|e| Error::OutputPin(e))?;
-        self.ready().map_err(|e| Error::InputPin(e))?;
+        self.mode_pins.set(Mode::Sleep)?;
+        self.ready()?;
         // self.serial.
         Ok(())
     }
