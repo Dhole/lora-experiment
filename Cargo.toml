@@ -12,16 +12,16 @@ test = false
 [dependencies]
 cortex-m = ">=0.6.1"
 cortex-m-rt = ">=0.6"
-cortex-m-rtfm = "=0.5.0-beta.1"
+cortex-m-rtfm = "=0.5.1"
 cortex-m-semihosting = "0.3.3"
-embedded-graphics = ">=0.6.0-alpha.2"
+embedded-graphics = "=0.6.1"
 heapless = "0.4.4"
 nb = "0.1.2"
 #panic-halt = "0.2.0"
 panic-semihosting = ">=0.5"
 #ssd1306 = "0.2.5"
-ssd1306 = ">=0.3.0-alpha.2"
-embedded-hal = ">=0.2.3"
+ssd1306 = "=0.3.1"
+embedded-hal = "=0.2.3"
 
 [dependencies.urpc]
 path = "../urpc"
@@ -35,7 +35,7 @@ features = ["as-slice"]
 
 [dependencies.stm32f1]
 features = ["stm32f103", "rt"]
-version = "0.8.0"
+version = "=0.9.0"
 
 [dependencies.stm32f1xx-hal]
 features = ["stm32f103", "rt"]

@@ -15,6 +15,7 @@ extern crate urpc;
 // extern crate panic_semihosting;
 
 mod e32_lora;
+mod serial;
 
 use cortex_m::asm;
 // use cortex_m_rt::{entry, exception};
@@ -22,7 +23,11 @@ use panic_semihosting as _;
 
 // use cortex_m_semihosting::hprintln;
 
-use urpc::{consts, server};
+use urpc::{
+    consts,
+    server::{self, Request as _},
+    OptBufNo, OptBufYes,
+};
 
 // you can put a breakpoint on `rust_begin_unwind` to catch panics
 // use panic_halt as _;
@@ -33,9 +38,15 @@ use rtfm::cyccnt::{Duration, Instant};
 
 use ssd1306;
 
-use embedded_graphics::fonts::Font6x8;
-use embedded_graphics::prelude::*;
-use embedded_graphics::Drawing;
+// use embedded_graphics::fonts::Font6x8;
+// use embedded_graphics::prelude::*;
+// use embedded_graphics::Drawing;
+use embedded_graphics::{
+    fonts::{Font6x8, Text},
+    pixelcolor::BinaryColor,
+    prelude::*,
+    style::TextStyle,
+};
 use embedded_hal::digital::v2::OutputPin;
 use ssd1306::{interface::I2cInterface, prelude::*};
 use stm32f1xx_hal::{
@@ -51,7 +62,7 @@ use stm32f1xx_hal::{
     i2c::{BlockingI2c, DutyCycle, Mode},
     // pac,
     prelude::*,
-    serial::{self, Config, Serial},
+    serial::{self as _serial, Config, Serial},
     stm32,
     timer::{self, CountDownTimer, Timer},
 };
@@ -71,8 +82,8 @@ type OledDisplay = ssd1306::mode::graphics::GraphicsMode<
     I2cInterface<BlockingI2c<I2C1, (PB8<Alternate<OpenDrain>>, PB9<Alternate<OpenDrain>>)>>,
 >;
 
-type SerialPCTx = serial::Tx<USART1>;
-type SerialPCRx = serial::Rx<USART1>;
+type SerialPCTx = _serial::Tx<USART1>;
+type SerialPCRx = _serial::Rx<USART1>;
 type SerialPCRxDma = dma::RxDma<SerialPCRx, dma::dma1::C5>;
 type SerialPCTxDma = dma::TxDma<SerialPCTx, dma::dma1::C4>;
 // type SerialPCRxDmaTransfer =
@@ -80,19 +91,19 @@ type SerialPCTxDma = dma::TxDma<SerialPCTx, dma::dma1::C4>;
 type SerialPCRxDmaTransfer = dma::Transfer<
     dma::W,
     &'static mut ArrayVec<[u8; 32]>,
-    dma::RxDma<serial::Rx<USART1>, dma::dma1::C5>,
+    dma::RxDma<_serial::Rx<USART1>, dma::dma1::C5>,
 >;
 const SYSCLK: Hertz = Hertz(72_000_000);
-const REFRESH_FREQ: Hertz = Hertz(8);
+const REFRESH_FREQ: Hertz = Hertz(6);
 
 const RX_PC_BUF_LEN: usize = 32;
 const TX_PC_BUF_LEN: usize = 32;
 
 server_requests! {
     ServerRequest;
-    (0, Ping([u8; 4], [u8; 4])),
-    (1, SendBytes((), ())),
-    (2, Add((u8, u8), u8))
+    (0, ping, Ping([u8; 4], OptBufNo, [u8; 4], OptBufNo)),
+    (1, send_bytes, SendBytes((), OptBufYes, (), OptBufNo)),
+    (2, add, Add((u8, u8), OptBufNo, u8, OptBufNo))
 }
 
 #[app(device = stm32, monotonic = rtfm::cyccnt::CYCCNT)]
@@ -156,7 +167,7 @@ const APP: () = {
             (scl, sda),
             &mut afio.mapr,
             Mode::Fast {
-                frequency: 400_000,
+                frequency: 800_000.hz(),
                 duty_cycle: DutyCycle::Ratio2to1,
             },
             clocks,
@@ -243,13 +254,29 @@ const APP: () = {
             write!(&mut line2, "{}", rx_pc_str).unwrap();
         });
         cx.resources.display.clear();
-        cx.resources.display.draw(
-            Font6x8::render_str(&line1).into_iter().chain(
-                Font6x8::render_str(&line2)
-                    .translate(Point::new(0, 16))
-                    .into_iter(),
-            ),
-        );
+        // cx.resources.display.draw(
+        //     Font6x8::render_str(&line1).into_iter().chain(
+        //         Font6x8::render_str(&line2)
+        //             .translate(Point::new(0, 16))
+        //             .into_iter(),
+        //     ),
+        // );
+        match cx.resources.display.draw_iter(
+            Text::new(&line1, Point::new(0, 0))
+                .into_styled(TextStyle::new(Font6x8, BinaryColor::On))
+                .into_iter()
+                .chain(
+                    Text::new(&line2, Point::new(0, 16))
+                        .into_styled(TextStyle::new(Font6x8, BinaryColor::On))
+                        .into_iter(),
+                ),
+        ) {
+            Ok(_) => {}
+            Err(_) => {}
+        }
+        // .draw(cx.resources.display)
+        // .unwrap();
+
         match cx.resources.display.flush() {
             Ok(()) => {}
             Err(e) => {
@@ -274,16 +301,14 @@ const APP: () = {
         static mut s_init: bool = false;
         static mut s_rx_pc: Option<SerialPCRxDma> = None;
         static mut s_rx_pc_transfer: Option<SerialPCRxDmaTransfer> = None;
-        static mut s_rpc_server: Option<server::RpcServer<ServerRequest>> = None;
+        static mut s_rpc_server: Option<server::RpcServer> = None;
         static mut s_tx_buf: Option<&'static mut ArrayVec<[u8; 32]>> = None;
 
         static mut s_dbg: u8 = 0;
 
         // hprintln!("b0");
         if !*s_init {
-            *s_rpc_server = Some(server::RpcServer::<ServerRequest>::new(
-                RX_PC_BUF_LEN as u16,
-            ));
+            *s_rpc_server = Some(server::RpcServer::new(RX_PC_BUF_LEN as u16));
             let rx_pc = cx.resources.rx_pc.take().unwrap();
 
             let rx_buf = singleton!(: ArrayVec<[u8; RX_PC_BUF_LEN]> =
@@ -309,7 +334,8 @@ const APP: () = {
         let (mut rx_buf, rx_pc) = rx_pc_transfer.wait();
 
         // DEBUG
-        let parse_res = match rpc_server.parse(&rx_buf) {
+        // let parse_res = match rpc_server.parse(&rx_buf) {
+        let parse_res = match ServerRequest::from_rpc(&mut rpc_server, &rx_buf) {
             Ok(r) => r,
             Err(e) => {
                 cx.resources.rx_pc_str.clear();
@@ -319,12 +345,12 @@ const APP: () = {
         };
         let read_len = match parse_res {
             server::ParseResult::NeedBytes(n) => n,
-            server::ParseResult::Request(req, opt_buf) => {
+            server::ParseResult::Request(req) => {
                 let mut tx_buf = s_tx_buf.take().unwrap();
                 unsafe {
                     tx_buf.set_len(32);
                 }
-                let write_len = match req.unwrap() {
+                let write_len = match req {
                     ServerRequest::Ping(ping) => {
                         let ping_body = ping.body;
                         cx.resources.rx_pc_str.clear();
@@ -336,12 +362,12 @@ const APP: () = {
                         .unwrap();
                         ping.reply(ping_body, &mut tx_buf).unwrap()
                     }
-                    ServerRequest::SendBytes(send_bytes) => {
+                    ServerRequest::SendBytes((send_bytes, buf)) => {
                         cx.resources.rx_pc_str.clear();
                         write!(
                             cx.resources.rx_pc_str,
                             "BYTES: {}",
-                            str::from_utf8(&opt_buf.unwrap()).unwrap()
+                            str::from_utf8(buf).unwrap()
                         )
                         .unwrap();
                         send_bytes.reply((), &mut tx_buf).unwrap()

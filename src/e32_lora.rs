@@ -1,3 +1,7 @@
+#![allow(dead_code)]
+
+use crate::serial::{Serial, SerialCfg};
+
 use core::convert;
 
 #[derive(Clone, Copy)]
@@ -16,7 +20,7 @@ pub enum UartRate {
     Bps19200 = 0b100,
     Bps38400 = 0b101,
     Bps57600 = 0b110,
-    Bps11520 = 0b111,
+    Bps115200 = 0b111,
 }
 
 #[derive(Clone, Copy)]
@@ -198,7 +202,6 @@ impl Config {
 }
 
 use embedded_hal::digital::v2::{InputPin, OutputPin};
-use stm32f1xx_hal::serial::Serial;
 
 pub enum Error<MODEPIN, AUXPIN>
 where
@@ -208,28 +211,6 @@ where
     OutputPin(MODEPIN::Error),
     InputPin(AUXPIN::Error),
 }
-
-// trait ErrorTrait<T> {}
-// impl<T: OutputPin> ErrorTrait<T> for T::Error {}
-// // impl<MODEPIN: OutputPin> ErrorTrait<MODEPIN> for MODEPIN::Error {}
-//
-// impl<MODEPIN, AUXPIN, ERROR> convert::From<ERROR> for Error<MODEPIN, AUXPIN>
-// where
-//     MODEPIN: OutputPin<Error = ERROR>,
-//     AUXPIN: InputPin,
-//     ERROR: ErrorTrait<MODEPIN>,
-// {
-//     fn from(error: ERROR) -> Self {
-//         Self::OutputPin(error)
-//     }
-// }
-
-// impl<MODEPIN: OutputPin, AUXPIN> convert::From<MODEPIN::Error> for Error<MODEPIN, AUXPIN> {
-//     // impl<MODEPIN: OutputPin, AUXPIN> convert::From<Error<MODEPIN, AUXPIN>> for Error<MODEPIN, AUXPIN> {
-//     fn from(error: MODEPIN::Error) -> Self {
-//         Self::OutputPin(error)
-//     }
-// }
 
 struct ModePins<MODEPIN>
 where
@@ -275,19 +256,23 @@ where
     }
 }
 
-struct LoRa<USART, SERIALPINS, MODEPIN, AUXPIN>
+struct LoRa<USART, SERIALCFG, SERIALPINS, MODEPIN, AUXPIN>
 where
+    SERIALCFG: SerialCfg,
     MODEPIN: OutputPin,
     AUXPIN: InputPin,
 {
     cfg: Config,
+    clocks: SERIALCFG::Clocks,
     serial: Serial<USART, SERIALPINS>,
     mode_pins: ModePins<MODEPIN>,
     aux: AUXPIN,
 }
 
-impl<USART, SERIALPINS, MODEPIN, AUXPIN> LoRa<USART, SERIALPINS, MODEPIN, AUXPIN>
+impl<USART, SERIALCFG, SERIALPINS, MODEPIN, AUXPIN>
+    LoRa<USART, SERIALCFG, SERIALPINS, MODEPIN, AUXPIN>
 where
+    SERIALCFG: SerialCfg,
     MODEPIN: OutputPin,
     AUXPIN: InputPin,
 {
@@ -295,10 +280,14 @@ where
         mode_pins: ModePins<MODEPIN>,
         aux: AUXPIN,
         serial: Serial<USART, SERIALPINS>,
+        clocks: SERIALCFG::Clocks,
+        ctx: &mut SERIALCFG::Context,
         cfg: Config,
     ) -> Self {
+        serial.set_baudrate(&mut ctx, 9600, clocks);
         Self {
             cfg,
+            clocks,
             serial,
             mode_pins,
             aux,
