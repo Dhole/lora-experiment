@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
-use crate::serial::{Serial, SerialCfg};
+use crate::serial::{Read, Serial, SerialCfg, Write};
+// use embedded_hal::serial::{Read, Write};
 
 use core::convert;
 
@@ -203,21 +204,33 @@ impl Config {
 
 use embedded_hal::digital::v2::{InputPin, OutputPin};
 
-pub enum Error<MODEPIN, AUXPIN>
+// pub enum Error<MODEPIN0, MODEPIN1, AUXPIN>
+// where
+//     MODEPIN0: OutputPin,
+//     MODEPIN1: OutputPin,
+//     AUXPIN: InputPin,
+// {
+//     OutputPin(MODEPIN::Error),
+//     InputPin(AUXPIN::Error),
+// }
+
+pub struct ModePins<PIN0, PIN1>
 where
-    MODEPIN: OutputPin,
-    AUXPIN: InputPin,
+    PIN0: OutputPin,
+    PIN1: OutputPin,
 {
-    OutputPin(MODEPIN::Error),
-    InputPin(AUXPIN::Error),
+    m0: PIN0,
+    m1: PIN1,
 }
 
-struct ModePins<MODEPIN>
+impl<PIN0, PIN1> ModePins<PIN0, PIN1>
 where
-    MODEPIN: OutputPin,
+    PIN0: OutputPin,
+    PIN1: OutputPin,
 {
-    m0: MODEPIN,
-    m1: MODEPIN,
+    pub fn new(m0: PIN0, m1: PIN1) -> Self {
+        Self { m0, m1 }
+    }
 }
 
 enum Mode {
@@ -227,11 +240,12 @@ enum Mode {
     Sleep = 0b11,
 }
 
-impl<MODEPIN> ModePins<MODEPIN>
+impl<PIN0, PIN1> ModePins<PIN0, PIN1>
 where
-    MODEPIN: OutputPin,
+    PIN0: OutputPin,
+    PIN1: OutputPin,
 {
-    fn _set(&mut self, mode: Mode) -> Result<(), MODEPIN::Error> {
+    fn _set(&mut self, mode: Mode) {
         let (m0_high, m1_high) = match mode {
             Mode::Normal => (false, false),
             Mode::WakeUp => (false, false),
@@ -239,52 +253,71 @@ where
             Mode::Sleep => (false, false),
         };
         if m0_high {
-            self.m0.set_high()?;
+            self.m0.set_high();
         } else {
-            self.m0.set_low()?;
+            self.m0.set_low();
         }
         if m1_high {
-            self.m1.set_high()?;
+            self.m1.set_high();
         } else {
-            self.m1.set_low()?;
+            self.m1.set_low();
         }
-        Ok(())
     }
-    fn set<AUXPIN: InputPin>(&mut self, mode: Mode) -> Result<(), Error<MODEPIN, AUXPIN>> {
-        self._set(mode).map_err(|e| Error::OutputPin(e))?;
-        Ok(())
+    fn set(&mut self, mode: Mode) {
+        self._set(mode);
     }
 }
 
-struct LoRa<USART, SERIALCFG, SERIALPINS, MODEPIN, AUXPIN>
+pub struct LoRa<SERIAL, MODEPIN0, MODEPIN1, AUXPIN>
 where
-    SERIALCFG: SerialCfg,
-    MODEPIN: OutputPin,
+    SERIAL: SerialCfg + Read + Write,
+    MODEPIN0: OutputPin,
+    MODEPIN1: OutputPin,
     AUXPIN: InputPin,
 {
     cfg: Config,
-    clocks: SERIALCFG::Clocks,
-    serial: Serial<USART, SERIALPINS>,
-    mode_pins: ModePins<MODEPIN>,
+    clocks: SERIAL::Clocks,
+    serial: SERIAL,
+    mode_pins: ModePins<MODEPIN0, MODEPIN1>,
     aux: AUXPIN,
 }
 
-impl<USART, SERIALCFG, SERIALPINS, MODEPIN, AUXPIN>
-    LoRa<USART, SERIALCFG, SERIALPINS, MODEPIN, AUXPIN>
+impl<SERIAL, MODEPIN0, MODEPIN1, AUXPIN> LoRa<SERIAL, MODEPIN0, MODEPIN1, AUXPIN>
 where
-    SERIALCFG: SerialCfg,
-    MODEPIN: OutputPin,
+    SERIAL: SerialCfg + Read + Write,
+    MODEPIN0: OutputPin,
+    MODEPIN1: OutputPin,
     AUXPIN: InputPin,
 {
     pub fn new(
-        mode_pins: ModePins<MODEPIN>,
+        mode_pins: ModePins<MODEPIN0, MODEPIN1>,
         aux: AUXPIN,
-        serial: Serial<USART, SERIALPINS>,
-        clocks: SERIALCFG::Clocks,
-        ctx: &mut SERIALCFG::Context,
-        cfg: Config,
+        mut serial: SERIAL,
+        clocks: SERIAL::Clocks,
+        mut ctx: &mut SERIAL::Context,
     ) -> Self {
+        // serial.write('B' as u8);
+        // serial.flush();
+        // for b in [0, 0, 0x17, 0x41, 0x41, 0x41].iter() {
+        // for b in [0, 0, 0x17, 0x41, 0x41, 0x41].iter() {
+        //     nb::block!(serial.write(*b));
+        // }
+        serial.write_all(b"\nHELLO\n").ok();
+        serial.flush();
+
         serial.set_baudrate(&mut ctx, 9600, clocks);
+        let cfg = Config {
+            addr: 0x0000,
+            uart_mode: UartMode::Parity8N1,
+            uart_rate: UartRate::Bps9600,
+            air_rate: AirRate::Bps2400,
+            channel: Channel::Mhz433,
+            trans_mode: TransMode::Transparent,
+            io_mode: IoMode::PushPull,
+            wakeup_time: WakeUpTime::Ms250,
+            fec: true,
+            tx_power: TxPower::P0,
+        };
         Self {
             cfg,
             clocks,
@@ -294,16 +327,14 @@ where
         }
     }
 
-    pub fn ready(&self) -> Result<(), Error<MODEPIN, AUXPIN>> {
-        while self.aux.is_low().map_err(|e| Error::InputPin(e))? {}
-        Ok(())
+    pub fn ready(&self) {
+        while self.aux.is_low().ok().unwrap() {}
     }
 
-    pub fn set_cfg(&mut self, cfg: Config) -> Result<(), Error<MODEPIN, AUXPIN>> {
+    pub fn set_cfg(&mut self, cfg: Config) {
         self.cfg = cfg;
-        self.mode_pins.set(Mode::Sleep)?;
-        self.ready()?;
+        self.mode_pins.set(Mode::Sleep);
+        self.ready();
         // self.serial.
-        Ok(())
     }
 }

@@ -82,17 +82,15 @@ type OledDisplay = ssd1306::mode::graphics::GraphicsMode<
     I2cInterface<BlockingI2c<I2C1, (PB8<Alternate<OpenDrain>>, PB9<Alternate<OpenDrain>>)>>,
 >;
 
-type SerialPCTx = _serial::Tx<USART1>;
-type SerialPCRx = _serial::Rx<USART1>;
+type SerialPCPins = (PA9<Alternate<PushPull>>, PA10<Input<Floating>>);
+type SerialPCTx = _serial::Tx<USART1, SerialPCPins>;
+type SerialPCRx = _serial::Rx<USART1, SerialPCPins>;
 type SerialPCRxDma = dma::RxDma<SerialPCRx, dma::dma1::C5>;
 type SerialPCTxDma = dma::TxDma<SerialPCTx, dma::dma1::C4>;
 // type SerialPCRxDmaTransfer =
 //     dma::Transfer<dma::W, &'static mut [u8; 4], dma::RxDma<serial::Rx<USART1>, dma::dma1::C5>>;
-type SerialPCRxDmaTransfer = dma::Transfer<
-    dma::W,
-    &'static mut ArrayVec<[u8; 32]>,
-    dma::RxDma<_serial::Rx<USART1>, dma::dma1::C5>,
->;
+type SerialPCRxDmaTransfer =
+    dma::Transfer<dma::W, &'static mut ArrayVec<[u8; 32]>, dma::RxDma<SerialPCRx, dma::dma1::C5>>;
 const SYSCLK: Hertz = Hertz(72_000_000);
 const REFRESH_FREQ: Hertz = Hertz(6);
 
@@ -201,6 +199,62 @@ const APP: () = {
         let mut rx_pc = rx_pc.with_dma(dma1_channels.5);
         // dma1_channels.4.listen(dma::Event::TransferComplete);
         let mut tx_pc = tx_pc.with_dma(dma1_channels.4);
+
+        // USART2
+        let tx_lora = gpioa.pa2.into_alternate_push_pull(&mut gpioa.crl);
+        let rx_lora = gpioa.pa3;
+        let mut serial_lora = Serial::usart2(
+            dp.USART2,
+            (tx_lora, rx_lora),
+            &mut afio.mapr,
+            Config::default().baudrate(9600.bps()),
+            clocks,
+            &mut rcc.apb1,
+        );
+
+        // BEGIN Full circle
+        let (mut tx_lora, mut rx_lora) = serial_lora.split();
+
+        let mut tx_lora = tx_lora.with_dma(dma1_channels.7);
+        let (_, tx_lora) = tx_lora.write(b"\nHELLO\n").wait();
+        let (tx_lora, dma_chan) = tx_lora.split();
+
+        // Again
+        let mut tx_lora = tx_lora.with_dma(dma_chan);
+        let (_, tx_lora) = tx_lora.write(b"\nGOODBYE\n").wait();
+        let (tx_lora, dma_chan) = tx_lora.split();
+
+        let mut serial_lora = Serial::join(tx_lora, rx_lora);
+        // END Full circle
+
+        // TODO: DMA
+        // let (mut tx_lora, mut rx_lora) = serial_lora.split();
+        // // rx_pc.listen();
+        // // dma2_channels.5.listen(dma::Event::TransferComplete);
+        // let mut rx_lora = rx_lora.with_dma(dma1_channels.6);
+        // // dma1_channels.4.listen(dma::Event::TransferComplete);
+        // let mut tx_lora = tx_lora.with_dma(dma1_channels.7);
+
+        // nb::block!(serial_lora.write('A' as u8));
+        // nb::block!(serial_lora.write('-' as u8));
+        // nb::block!(serial_lora.flush());
+        let mut serial_lora = serial::Serial::new(serial_lora);
+        // nb::block!(serial_lora.write('B' as u8));
+        // nb::block!(serial_lora.flush());
+
+        let m0 = gpiob.pb0.into_push_pull_output(&mut gpiob.crl);
+        let m1 = gpiob.pb1.into_push_pull_output(&mut gpiob.crl);
+        let aux = gpioa.pa7;
+
+        let mut ctx = serial::Context::new(afio.mapr, rcc.apb1);
+
+        let lora = e32_lora::LoRa::new(
+            e32_lora::ModePins::new(m0, m1),
+            aux,
+            serial_lora,
+            clocks,
+            &mut ctx,
+        );
 
         // Configure the syst timer to trigger an update every second and enables interrupt
         let mut timer_handler =
