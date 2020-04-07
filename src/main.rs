@@ -17,6 +17,8 @@ extern crate urpc;
 mod e32_lora;
 mod serial;
 
+use as_slice::{AsMutSlice, AsSlice};
+
 use cortex_m::asm;
 // use cortex_m_rt::{entry, exception};
 use panic_semihosting as _;
@@ -47,10 +49,12 @@ use embedded_graphics::{
     prelude::*,
     style::TextStyle,
 };
-use embedded_hal::digital::v2::OutputPin;
+use embedded_hal::digital::v2::{InputPin, OutputPin};
 use ssd1306::{interface::I2cInterface, prelude::*};
 use stm32f1xx_hal::{
     self,
+    // pac,
+    delay::Delay,
     device::I2C1,
     dma,
     gpio::{
@@ -60,7 +64,6 @@ use stm32f1xx_hal::{
     },
     gpio::{Alternate, Floating, Input, OpenDrain, Output, PushPull, State},
     i2c::{BlockingI2c, DutyCycle, Mode},
-    // pac,
     prelude::*,
     serial::{self as _serial, Config, Serial},
     stm32,
@@ -128,6 +131,7 @@ const APP: () = {
         cx.core.DCB.enable_trace();
         cx.core.DWT.enable_cycle_counter();
         let dp = stm32::Peripherals::take().unwrap();
+        let cp = cortex_m::peripheral::Peripherals::take().unwrap();
         // let p = &mut c.core; //cortex_m::peripheral::Peripherals::take().unwrap();
         //                      // Take ownership over the raw flash and rcc devices and convert them into the corresponding
         //                      // HAL structs
@@ -200,6 +204,13 @@ const APP: () = {
         // dma1_channels.4.listen(dma::Event::TransferComplete);
         let mut tx_pc = tx_pc.with_dma(dma1_channels.4);
 
+        let aux = gpioa.pa7;
+
+        let mut m0 = gpiob.pb0.into_push_pull_output(&mut gpiob.crl);
+        let mut m1 = gpiob.pb1.into_push_pull_output(&mut gpiob.crl);
+
+        let mut delay = Delay::new(cp.SYST, clocks);
+
         // USART2
         let tx_lora = gpioa.pa2.into_alternate_push_pull(&mut gpioa.crl);
         let rx_lora = gpioa.pa3;
@@ -215,14 +226,57 @@ const APP: () = {
         // BEGIN Full circle
         let (mut tx_lora, mut rx_lora) = serial_lora.split();
 
-        let mut tx_lora = tx_lora.with_dma(dma1_channels.7);
-        let (_, tx_lora) = tx_lora.write(b"\nHELLO\n").wait();
-        let (tx_lora, dma_chan) = tx_lora.split();
+        let mut tx_dma_lora = tx_lora.with_dma(dma1_channels.7);
+        let mut rx_dma_lora = rx_lora.with_dma(dma1_channels.6);
 
+        m0.set_low();
+        m1.set_low();
+        delay.delay_ms(2u16);
+        delay.delay_ms(10u16);
+        while aux.is_low().ok().unwrap() {}
+        delay.delay_ms(2u16);
+
+        // while aux.is_low().ok().unwrap() {}
+        let (_, tx_dma_lora) = tx_dma_lora.write(b"XXX").wait();
+
+        while aux.is_low().ok().unwrap() {}
+        delay.delay_ms(2u16);
+
+        m0.set_high();
+        m1.set_high();
+        delay.delay_ms(2u16);
+        delay.delay_ms(10u16);
+        while aux.is_low().ok().unwrap() {}
+        delay.delay_ms(2u16);
+
+        let (_, tx_dma_lora) = tx_dma_lora.write(b"\xc1\xc1\xc1").wait();
+        // let (_, tx_dma_lora) = tx_dma_lora.write(b"\xc3\xc3\xc3").wait();
+        // let (_, tx_dma_lora) = tx_dma_lora.write(b"XXX").wait();
+
+        let buf = singleton!(: ArrayVec<[u8; 32]> = ArrayVec::<[u8; 32]>::new()).unwrap();
+        unsafe {
+            buf.set_len(6);
+        }
+        // let buf = singleton!(: [u8; 6] = [0; 6]).unwrap();
+
+        let mut rx_pc_str = ArrayString::<[u8; 32]>::new();
+        // write!(rx_pc_str, "{}", buf.as_slice().len());
+        // BEGIN READ DMA
+        let (buf, rx_dma_lora) = rx_dma_lora.read(buf).wait();
+
+        for b in buf.iter() {
+            write!(rx_pc_str, "{:02x}", b).unwrap();
+        }
+        // let b = nb::block!(rx_lora.read()).unwrap();
+        // write!(rx_pc_str, "{:02x}", b).unwrap();
+        // END READ DMA
+
+        let (tx_lora, tx_dma_chan) = tx_dma_lora.split();
+        let (rx_lora, rx_dma_chan) = rx_dma_lora.split();
         // Again
-        let mut tx_lora = tx_lora.with_dma(dma_chan);
-        let (_, tx_lora) = tx_lora.write(b"\nGOODBYE\n").wait();
-        let (tx_lora, dma_chan) = tx_lora.split();
+        // let mut tx_lora = tx_lora.with_dma(dma_chan);
+        // let (_, tx_lora) = tx_lora.write(b"\nGOODBYE\n").wait();
+        // let (tx_lora, dma_chan) = tx_lora.split();
 
         let mut serial_lora = Serial::join(tx_lora, rx_lora);
         // END Full circle
@@ -241,10 +295,6 @@ const APP: () = {
         let mut serial_lora = serial::Serial::new(serial_lora);
         // nb::block!(serial_lora.write('B' as u8));
         // nb::block!(serial_lora.flush());
-
-        let m0 = gpiob.pb0.into_push_pull_output(&mut gpiob.crl);
-        let m1 = gpiob.pb1.into_push_pull_output(&mut gpiob.crl);
-        let aux = gpioa.pa7;
 
         let mut ctx = serial::Context::new(afio.mapr, rcc.apb1);
 
@@ -271,7 +321,7 @@ const APP: () = {
             display,
             tx_pc: Some(tx_pc),
             rx_pc: Some(rx_pc),
-            rx_pc_str: ArrayString::<[u8; 32]>::new(),
+            rx_pc_str: rx_pc_str,
         }
     }
 
